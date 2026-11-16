@@ -9,7 +9,9 @@ python consumer_csv.py --from-beginning   # terminal 1
 python producer_csv.py                    # terminal 2: sends one row every 0.5 s
 ```
 
-Other flags. Producer: `--topic`, `--delay`, `--key none`. Consumer: `--topic`, `--group`, `--name`, `--limit N`, `--idle-timeout S`, `--check-order`.
+Other flags. Producer: `--file`, `--topic`, `--delay`, `--key none`. Consumer: `--topic`, `--group`, `--name`, `--limit N`, `--idle-timeout S`, `--check-order`, plus `--validate` and `--dlq TOPIC` for Phase 2.
+
+Phase 1 (clean data) comes first. [Phase 2 (dirty data)](#phase-2--dirty-data) is at the end.
 
 ## Dataset
 
@@ -87,3 +89,72 @@ I sent the same 200 rows into three new topics, then read each one from the begi
 	- Commas or line breaks inside a field break the line-by-line splitting.
 	- Bad rows are only found by the consumer, after they are already stored in the topic.
 - **Why are offsets critical?** An offset is a bookmark. It lets a consumer restart without losing or repeating rows, lets different groups read the same data on their own, and lets you replay history on purpose by moving the bookmark back.
+
+---
+
+## Phase 2 — Dirty data
+
+Data: `data/transactions_dirty.csv`. The setup is the same as Phase 1: a new topic `transactions-dirty` with 2 partitions and `user_id` as the key, and the same producer, unchanged.
+
+### What is wrong with the file
+
+There are 14 rows, and 8 of them have a problem:
+
+| Row | Problem |
+|---|---|
+| `3,101,,2024-01-01 10:01:10` | amount is missing |
+| `4,abc,89.9,…` | user_id is not a number |
+| `6,102,15.2,not-a-date` | the date can't be read |
+| `9,106,seven,…` | amount is written as a word |
+| `2,102,250.5,…` (second copy) | exact duplicate of transaction 2, arriving after transaction 10 |
+| `11,107,55.0,` | timestamp is missing |
+| `12,108,20.0,2024/01/01 10:10:00` | date uses a different format |
+| `13,109` | row is cut short (2 of 4 fields) |
+
+### Step 1 — Running the unchanged pipeline
+
+- Kafka accepted all 14 rows without complaint, and the Phase 1 consumer printed them all. Kafka never looks inside a message, so it has no way to notice bad data.
+- `user_id=abc` was treated as a key like any other and was sent to partition 1.
+- The only sign of trouble was the ordering check: the duplicate of transaction 2 showed up as one out-of-order row in partition 1.
+
+### Step 2 — A consumer that trusts the data
+
+I wrote a small test consumer that adds up the `amount` column and saves its offset after each row. It crashed on `3,101,,…` because an empty amount can't be turned into a number.
+
+- Because it crashed before saving its offset, every restart read the same row and crashed again. I tried 3 times.
+- Partition 1 still had 10 unread rows, all stuck behind that one bad row in partition 0. **One bad message can stop the whole consumer** (this is called a "poison pill").
+- Side note: after a crash, the restarted consumer waited about 10 s before getting its partitions. Kafka first waits for the crashed member's session to time out.
+
+### Step 3 — The adapted pipeline
+
+- **Producer: unchanged.** It still passes rows through exactly as they are. The raw topic stays a faithful copy of the source, and nothing is thrown away before anyone has looked at it.
+- **Consumer: new `--validate` and `--dlq` options.** Each row is marked as one of:
+	- **OK** if all checks pass.
+	- **FIXED** if the date is in `YYYY/MM/DD` format. It is rewritten to the standard format, since the meaning is clear.
+	- **REJECTED** if a value is missing or unreadable, the row has the wrong number of fields, or its `transaction_id` was already accepted. A rejected row is copied to the dead-letter topic `transactions-dirty-dlq`, with the reason and its original location (topic/partition/offset) stored in message headers.
+- **The offset is saved for every row, rejected ones included,** so a bad row can no longer block the consumer. The dead-letter copy is confirmed before the offset is saved, so a rejected row can't get lost.
+
+| Result | Rows |
+|---|---|
+| OK | 6 |
+| FIXED | 1 (transaction 12) |
+| REJECTED → dead-letter topic | 7 (one for each other problem in the table above) |
+
+- Restarting the same group read 0 rows, so nothing got stuck and nothing was repeated.
+- Reading the dead-letter topic shows each bad row with its reason, for example `error=amount is missing, source=transactions-dirty/0/1`. Someone can fix those rows at the source and send them again.
+
+### Limits I found
+
+- **Duplicate detection forgets on restart.** The consumer only remembers ids while it is running. I stopped one right after it read transaction 2 and restarted it, and the duplicate was accepted as OK. A real fix needs storage that survives restarts, such as a database that only allows each `transaction_id` once.
+- **It only works because both copies have the same key.** Both copies of transaction 2 belong to user 102, so they land in the same partition and are read by the same consumer. A duplicate with a different (for example broken) `user_id` could land in another partition and reach a consumer that never saw the original.
+- **Fixing versus rejecting is a judgement call.** I only fixed the date format, where the meaning is clear. A missing amount can't be guessed.
+
+### Tasks 5–7 again, with dirty data
+
+- **Offsets (Task 5):** when you save the offset decides what happens to a bad row. If you save only after success, the consumer crashes on the same row forever. If you always save and keep a dead-letter copy, it carries on and nothing is lost.
+- **Consumer groups (Task 6):** I didn't re-run this, because Kafka assigns partitions without looking at what's in the rows. What it does mean is that every consumer in a group has to run the same checks.
+- **Ordering (Task 7):** the duplicate of transaction 2 arrives after transaction 10 with an older timestamp (10:00:20 after 10:06:15). Kafka keeps the order rows were sent in, not the order events happened. Spotting late or repeated events is the consumer's job.
+
+### What Phase 2 adds to the reflection
+
+Because Kafka doesn't care about structure, there is no gate: bad data goes straight into the topic. Checks have to be built into the producers or consumers. In streaming, how you save offsets decides whether a bad row stops everything, gets silently skipped, or is set aside for someone to fix.
